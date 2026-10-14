@@ -1,14 +1,14 @@
 const WebSocket = require('ws');
 
-// Sử dụng cổng động từ Cloud cấp hoặc mặc định là 8080 khi test trên máy cá nhân
 const PORT = process.env.PORT || 8080;
 const wss = new WebSocket.Server({ port: PORT });
-let waitingPlayer = null;
+
+let waitingQueue = [];
 
 console.log(`🚀 Matchmaking Server đang chạy trên cổng ${PORT}`);
 
 wss.on('connection', (ws) => {
-    console.log('👤 Có một người chơi vừa kết nối thành công!');
+    console.log('👤 Có người chơi vừa kết nối!');
 
     ws.on('message', (message) => {
         let data;
@@ -18,39 +18,71 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        // Khi nhận được tín hiệu tìm trận từ người chơi
+        // Khi người chơi bấm tìm trận
         if (data.type === 'FIND_MATCH') {
-            if (waitingPlayer && waitingPlayer !== ws && waitingPlayer.readyState === WebSocket.OPEN) {
-                let roomId = 'room_' + Math.random().toString(36).substring(2, 9);
-                
-                // Gửi thông báo cho người chơi 1 (Host - Index 0)
-                waitingPlayer.send(JSON.stringify({ 
-                    type: 'MATCH_FOUND', 
-                    room: roomId, 
-                    playerIndex: 0 
-                }));
-                
-                // Gửi thông báo cho người chơi 2 (Guest - Index 1)
-                ws.send(JSON.stringify({ 
-                    type: 'MATCH_FOUND', 
-                    room: roomId, 
-                    playerIndex: 1 
-                }));
-
-                console.log(`⚔️ Ghép trận thành công! Phòng: ${roomId}`);
-                waitingPlayer = null; // Reset hàng đợi
-            } else {
-                waitingPlayer = ws;
-                ws.send(JSON.stringify({ type: 'WAITING' }));
-                console.log('⏳ Đang chờ thêm người chơi vào hàng đợi...');
+            if (!waitingQueue.includes(ws)) {
+                waitingQueue.push(ws);
+                console.log(`⏳ Đã thêm vào hàng đợi. Tổng số người chờ: ${waitingQueue.length}`);
             }
+
+            // Gửi thông báo số lượng đang chờ về client
+            ws.send(JSON.stringify({ type: 'WAITING', queueCount: waitingQueue.length }));
+
+            // Nếu gom đủ 5 người trong hàng đợi, tạo phòng ngay lập tức
+            if (waitingQueue.length >= 5) {
+                let matchGroup = waitingQueue.splice(0, 5);
+                dispatchRoom(matchGroup);
+            }
+        }
+
+        // Khi người chơi chờ đủ 60s hoặc bấm hủy/hết giờ, yêu cầu gom nhóm những ai đang đứng chờ lại thành 1 phòng chung
+        if (data.type === 'FORCE_MATCH') {
+            let index = waitingQueue.indexOf(ws);
+            if (index !== -1) {
+                waitingQueue.splice(index, 1);
+            }
+            // Gom tất cả những người còn lại trong hàng đợi vào chung một trận
+            if (waitingQueue.length > 0) {
+                let matchGroup = [ws, ...waitingQueue];
+                waitingQueue = []; // Reset hàng đợi
+                dispatchRoom(matchGroup);
+            } else {
+                // Nếu chỉ có một mình người này lẻ loi, tạo phòng 1 người (còn lại bù AI)
+                dispatchRoom([ws]);
+            }
+        }
+
+        if (data.type === 'CANCEL_MATCH') {
+            removeFromQueue(ws);
         }
     });
 
     ws.on('close', () => {
-        if (waitingPlayer === ws) {
-            waitingPlayer = null;
-            console.log('❌ Người chơi đã rời hàng đợi.');
-        }
+        removeFromQueue(ws);
     });
 });
+
+function removeFromQueue(ws) {
+    let index = waitingQueue.indexOf(ws);
+    if (index !== -1) {
+        waitingQueue.splice(index, 1);
+    }
+}
+
+// Hàm phân phát phòng chung cho tất cả người chơi đang chờ
+function dispatchRoom(group) {
+    let roomId = 'room_' + Math.random().toString(36).substring(2, 9);
+    let totalRealPlayers = group.length;
+    console.log(`⚔️ Tạo phòng chung: ${roomId} với ${totalRealPlayers} người chơi thực tế.`);
+
+    group.forEach((client, index) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                type: 'MATCH_FOUND',
+                room: roomId,
+                playerIndex: index, // Vị trí của từng người (0, 1, 2...)
+                totalPlayers: totalRealPlayers // Số người thực tế để client biết đường bù AI cho đủ 5 phe
+            }));
+        }
+    });
+}
