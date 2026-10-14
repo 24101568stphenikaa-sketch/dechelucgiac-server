@@ -1,88 +1,197 @@
+const crypto = require('node:crypto');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
+const MAX_PLAYERS = 5;
+const WAIT_TIME_MS = 60_000;
 const wss = new WebSocket.Server({ port: PORT });
-
-let waitingQueue = [];
+const waitingQueue = [];
+const rooms = new Map();
 
 console.log(`🚀 Matchmaking Server đang chạy trên cổng ${PORT}`);
 
 wss.on('connection', (ws) => {
-    console.log('👤 Có người chơi vừa kết nối!');
-
     ws.on('message', (message) => {
         let data;
         try {
             data = JSON.parse(message);
-        } catch (e) {
+        } catch (error) {
+            send(ws, { type: 'ERROR', message: 'Yêu cầu không phải JSON hợp lệ.' });
             return;
         }
 
-        // Khi người chơi bấm tìm trận
+        if (!data || typeof data.type !== 'string') return;
+
         if (data.type === 'FIND_MATCH') {
-            if (!waitingQueue.includes(ws)) {
-                waitingQueue.push(ws);
-                console.log(`⏳ Đã thêm vào hàng đợi. Tổng số người chờ: ${waitingQueue.length}`);
+            if (ws.matchRoom) return;
+            if (!waitingQueue.some((entry) => entry.ws === ws) && ws.readyState === WebSocket.OPEN) {
+                waitingQueue.push({ ws, queuedAt: Date.now() });
+                console.log(`⏳ Hàng đợi: ${waitingQueue.length}/${MAX_PLAYERS}`);
             }
-
-            // Gửi thông báo số lượng đang chờ về client
-            ws.send(JSON.stringify({ type: 'WAITING', queueCount: waitingQueue.length }));
-
-            // Nếu gom đủ 5 người trong hàng đợi, tạo phòng ngay lập tức
-            if (waitingQueue.length >= 5) {
-                let matchGroup = waitingQueue.splice(0, 5);
-                dispatchRoom(matchGroup);
-            }
-        }
-
-        // Khi người chơi chờ đủ 60s hoặc bấm hủy/hết giờ, yêu cầu gom nhóm những ai đang đứng chờ lại thành 1 phòng chung
-        if (data.type === 'FORCE_MATCH') {
-            let index = waitingQueue.indexOf(ws);
-            if (index !== -1) {
-                waitingQueue.splice(index, 1);
-            }
-            // Gom tất cả những người còn lại trong hàng đợi vào chung một trận
-            if (waitingQueue.length > 0) {
-                let matchGroup = [ws, ...waitingQueue];
-                waitingQueue = []; // Reset hàng đợi
-                dispatchRoom(matchGroup);
-            } else {
-                // Nếu chỉ có một mình người này lẻ loi, tạo phòng 1 người (còn lại bù AI)
-                dispatchRoom([ws]);
-            }
-        }
-
-        if (data.type === 'CANCEL_MATCH') {
-            removeFromQueue(ws);
+            dispatchReadyGroups();
+            if (waitingQueue.some((entry) => entry.ws === ws)) sendQueueStatus();
+        } else if (data.type === 'FORCE_MATCH') {
+            forceMatch(ws);
+        } else if (data.type === 'CANCEL_MATCH') {
+            if (removeFromQueue(ws)) sendQueueStatus();
+        } else if (data.type === 'GAME_ACTION') {
+            relayGameAction(ws, data.action);
         }
     });
 
     ws.on('close', () => {
-        removeFromQueue(ws);
+        if (removeFromQueue(ws)) sendQueueStatus();
+        removeFromRoom(ws);
     });
 });
 
-function removeFromQueue(ws) {
-    let index = waitingQueue.indexOf(ws);
-    if (index !== -1) {
-        waitingQueue.splice(index, 1);
+wss.on('error', (error) => {
+    console.error('Matchmaking server error:', error);
+});
+
+const queueTimer = setInterval(dispatchReadyGroups, 250);
+queueTimer.unref();
+
+function send(ws, data) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+}
+
+function sendQueueStatus() {
+    const queueCount = waitingQueue.length;
+    for (const entry of waitingQueue) {
+        send(entry.ws, {
+            type: 'WAITING',
+            queueCount,
+            waitMs: Math.max(0, Date.now() - entry.queuedAt)
+        });
     }
 }
 
-// Hàm phân phát phòng chung cho tất cả người chơi đang chờ
-function dispatchRoom(group) {
-    let roomId = 'room_' + Math.random().toString(36).substring(2, 9);
-    let totalRealPlayers = group.length;
-    console.log(`⚔️ Tạo phòng chung: ${roomId} với ${totalRealPlayers} người chơi thực tế.`);
-
-    group.forEach((client, index) => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'MATCH_FOUND',
-                room: roomId,
-                playerIndex: index, // Vị trí của từng người (0, 1, 2...)
-                totalPlayers: totalRealPlayers // Số người thực tế để client biết đường bù AI cho đủ 5 phe
-            }));
-        }
-    });
+function removeFromQueue(ws) {
+    const index = waitingQueue.findIndex((entry) => entry.ws === ws);
+    if (index === -1) return false;
+    waitingQueue.splice(index, 1);
+    return true;
 }
+
+function dispatchReadyGroups() {
+    let dispatched = false;
+    while (waitingQueue.length >= MAX_PLAYERS) {
+        dispatchRoom(waitingQueue.splice(0, MAX_PLAYERS).map((entry) => entry.ws));
+        dispatched = true;
+    }
+
+    if (waitingQueue.length && Date.now() - waitingQueue[0].queuedAt >= WAIT_TIME_MS) {
+        dispatchRoom(waitingQueue.splice(0, MAX_PLAYERS).map((entry) => entry.ws));
+        dispatched = true;
+    }
+
+    if (dispatched) sendQueueStatus();
+}
+
+function forceMatch(ws) {
+    if (!waitingQueue.some((entry) => entry.ws === ws)) return;
+    dispatchRoom(waitingQueue.splice(0, MAX_PLAYERS).map((entry) => entry.ws));
+    sendQueueStatus();
+}
+
+function dispatchRoom(group) {
+    const players = group.filter((client) => client.readyState === WebSocket.OPEN);
+    if (!players.length) return;
+
+    const roomId = `room_${crypto.randomBytes(5).toString('hex')}`;
+    const realPlayers = players.length;
+    const seed = crypto.randomInt(1, 0x7fffffff);
+    const room = { clients: new Map(), realPlayers };
+    rooms.set(roomId, room);
+
+    players.forEach((client, playerIndex) => {
+        client.matchRoom = roomId;
+        client.matchPlayerIndex = playerIndex;
+        room.clients.set(client, playerIndex);
+        send(client, {
+            type: 'MATCH_FOUND',
+            room: roomId,
+            playerIndex,
+            realPlayers,
+            aiCount: MAX_PLAYERS - realPlayers,
+            totalPlayers: MAX_PLAYERS,
+            seed
+        });
+    });
+
+    console.log(`⚔️ Phòng ${roomId}: ${realPlayers} người thật, ${MAX_PLAYERS - realPlayers} AI.`);
+}
+
+function relayGameAction(ws, action) {
+    const room = rooms.get(ws.matchRoom);
+    if (!room || !room.clients.has(ws) || !action || typeof action.type !== 'string') return;
+
+    const playerIndex = room.clients.get(ws);
+    let safeAction;
+
+    if (action.type === 'BUY_TILE' && isValidCoordinate(action)) {
+        safeAction = {
+            type: 'BUY_TILE',
+            q: action.q,
+            r: action.r,
+            owner: playerIndex,
+            moneySpent: validMoney(action.moneySpent)
+        };
+    } else if (action.type === 'BUILD' && isValidCoordinate(action) &&
+        ['house', 'service', 'industrial'].includes(action.building)) {
+        safeAction = {
+            type: 'BUILD',
+            q: action.q,
+            r: action.r,
+            building: action.building,
+            owner: playerIndex,
+            moneySpent: validMoney(action.moneySpent)
+        };
+    } else if (action.type === 'AI_TURN' && playerIndex === 0 &&
+        Number.isInteger(action.owner) && action.owner >= room.realPlayers &&
+        action.owner < MAX_PLAYERS && isValidCoordinate(action) &&
+        ['house', 'service', 'industrial'].includes(action.building)) {
+        safeAction = {
+            type: 'AI_TURN',
+            q: action.q,
+            r: action.r,
+            owner: action.owner,
+            building: action.building,
+            moneySpent: validMoney(action.moneySpent)
+        };
+    } else {
+        return;
+    }
+
+    const message = JSON.stringify({ type: 'GAME_ACTION', room: ws.matchRoom, action: safeAction });
+    for (const client of room.clients.keys()) {
+        if (client !== ws && client.readyState === WebSocket.OPEN) client.send(message);
+    }
+}
+
+function isValidCoordinate(action) {
+    return Number.isInteger(action.q) && Number.isInteger(action.r);
+}
+
+function validMoney(value) {
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+function removeFromRoom(ws) {
+    const roomId = ws.matchRoom;
+    if (!roomId) return;
+
+    const room = rooms.get(roomId);
+    if (room) {
+        room.clients.delete(ws);
+        for (const client of room.clients.keys()) {
+            send(client, { type: 'PLAYER_DISCONNECTED', room: roomId, playerIndex: ws.matchPlayerIndex });
+        }
+        if (room.clients.size === 0) rooms.delete(roomId);
+    }
+
+    ws.matchRoom = null;
+}
+
+module.exports = { wss, waitingQueue, rooms, dispatchReadyGroups };
